@@ -18,7 +18,7 @@ spec:
     spec:
       containers:
       - name: frontend-container
-        image: sath08acr12345.azurecr.io/<image_name>:<tag>
+        image: sath08acr12345.azurecr.io/frontend:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 80
