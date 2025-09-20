@@ -1,93 +1,72 @@
-# week08/.github/workflows/frontend-cd.yml
+name: Frontend CD
 
-name: CD - Deploy Frontend to AKS
-
-# This workflow can be called by other workflows and takes inputs.
-# Or it can be run manually if you provide the IPs.
 on:
   workflow_dispatch:
-    inputs:
-      product_api_ip:
-        description: 'External IP of Product Service'
-        required: true
-        default: 'http://<ip_address>:8000'
-      order_api_ip:
-        description: 'External IP of Order Service (e.g., http://Y.Y.Y.Y:8001)'
-        required: true
-        default: 'http://<ip_address>:8001'
-      aks_cluster_name:
-        description: 'Name of the AKS Cluster to deploy to'
-        required: true
-        default: '<aks_name>'
-      aks_resource_group:
-        description: 'Resource Group of the AKS Cluster'
-        required: true
-        default: '<<resource_group_name>'
-
-  workflow_call:
-    inputs:
-      product_api_ip:
-        required: true
-        type: string
-      order_api_ip:
-        required: true
-        type: string
-      aks_cluster_name:
-        required: true
-        type: string
-      aks_resource_group:
-        required: true
-        type: string
 
 jobs:
   deploy_frontend:
     runs-on: ubuntu-latest
-    environment: Production
+    env:
+      # From repo Settings → Actions → Variables
+      AKS_RG:   ${{ vars.AKS_RG }}
+      AKS_NAME: ${{ vars.AKS_NAME }}
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # Azure login using a Service Principal secret
       - name: Azure Login
         uses: azure/login@v1
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      # Login to Azure Container Registry (ACR)
-      - name: Login to Azure Container Registry
-        run: az acr login --name ${{ secrets.AZURE_CONTAINER_REGISTRY }}
-
-      - name: Inject Backend IPs into Frontend main.js
-        run: |
-          echo "Injecting IPs into frontend/static/js/main.js"
-          # Ensure frontend/main.js is directly in the path for sed
-          sed -i "s|_PRODUCT_API_URL_|${{ inputs.product_api_ip }}|g" frontend/main.js
-          sed -i "s|_ORDER_API_URL_|${{ inputs.order_api_ip }}|g" frontend/main.js
-          
-          # Display the modified file content for debugging
-          echo "--- Modified main.js content ---"
-          cat frontend/main.js
-          echo "---------------------------------"
-
-      # Build and Push Docker image for Frontend
-      - name: Build and Push Frontend Image
-        run: |
-          docker build -t ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest ./frontend/
-          docker push ${{ secrets.AZURE_CONTAINER_REGISTRY }}/frontend:latest
-
-      - name: Set Kubernetes context (get AKS credentials)
-        uses: azure/aks-set-context@v3
+      - name: Set Kubernetes context (AKS)
+        uses: azure/aks-set-context@v4
         with:
-          resource-group: ${{ inputs.aks_resource_group }}
-          cluster-name: ${{ inputs.aks_cluster_name }}
+          resource-group: ${{ env.AKS_RG }}
+          cluster-name:  ${{ env.AKS_NAME }}
 
-      - name: Deploy Frontend to AKS
+      - name: Verify k8s access
+        run: kubectl get nodes
+
+      # Apply only the frontend (assumes image: <your-acr>.azurecr.io/frontend:latest is already set)
+      - name: Deploy frontend
+        run: kubectl apply -f k8s/frontend.yaml
+
+      # Wait for the frontend deployment to become available.
+      # We try to detect the deployment name automatically (matches *front*).
+      - name: Wait for frontend rollout
+        shell: bash
         run: |
-          echo "Deploying frontend with latest tag to AKS cluster: ${{ inputs.aks_cluster_name }}"
-          cd k8s/
-          # Ensure frontend-service.yaml is configured with your ACR
-          kubectl apply -f frontend.yaml
+          set -euo pipefail
+          DEPLOY_NAME="$(kubectl get deploy -o name | grep -i 'deploy/front' | head -n 1 || true)"
+          if [[ -z "$DEPLOY_NAME" ]]; then
+            DEPLOY_NAME="deploy/$(kubectl get deploy -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -i 'front' | head -n 1)"
+          fi
+          if [[ -z "$DEPLOY_NAME" || "$DEPLOY_NAME" == "deploy/" ]]; then
+            echo "Could not find a frontend deployment (name containing 'front')."
+            kubectl get deploy -o wide
+            exit 1
+          fi
+          echo "Waiting for rollout of: $DEPLOY_NAME"
+          kubectl rollout status "$DEPLOY_NAME" --timeout=180s
 
-      - name: Logout from Azure (AKS deployment)
+      - name: Show services & capture frontend EXTERNAL-IP
+        id: svc
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl get svc -o wide
+          SVC_NAME="$(kubectl get svc -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -i 'front' | head -n 1 || true)"
+          if [[ -z "$SVC_NAME" ]]; then
+            echo "Could not find a frontend Service (name containing 'front')."
+            exit 1
+          fi
+          echo "Detected frontend service: $SVC_NAME"
+          FRONTEND_IP="$(kubectl get svc "$SVC_NAME" -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+          echo "FRONTEND_EXTERNAL_IP=$FRONTEND_IP" >> "$GITHUB_OUTPUT"
+          echo "Frontend EXTERNAL-IP: $FRONTEND_IP"
+
+      - name: Logout
+        if: always()
         run: az logout
