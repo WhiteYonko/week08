@@ -2,47 +2,89 @@ name: Security Scan (Docker Scout)
 
 on:
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Tag to scan (defaults to latest)"
+        required: false
+        default: latest
 
-env:
-  ACR_NAME: ${{ vars.ACR_NAME || 'sath08acr12345' }}
-  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER || 'sath08acr12345.azurecr.io' }}
+permissions:
+  contents: read
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Pre Azure login
+        run: echo "Starting security scan…"
+
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Azure login
-        uses: azure/login@v1
+        uses: azure/login@v2
         with:
+          # JSON from: az ad sp create-for-rbac --sdk-auth …
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # Log in to ACR with a pull-only token so Scout can read images
       - name: Login to ACR (pull-only token)
+        id: acr
+        shell: bash
         run: |
-          TOKEN=$(az acr login -n "$ACR_NAME" --expose-token --query accessToken -o tsv)
-          echo "$TOKEN" | docker login "$ACR_LOGIN_SERVER" -u 00000000-0000-0000-0000-000000000000 --password-stdin
+          set -euo pipefail
+          ACR_NAME="${{ vars.ACR_NAME }}"
+          if [ -z "$ACR_NAME" ]; then
+            echo "ACR_NAME GitHub variable is not set"; exit 1
+          fi
+          TOKEN_JSON=$(az acr login --name "$ACR_NAME" --expose-token -o json)
+          SERVER=$(echo "$TOKEN_JSON" | jq -r '.loginServer')
+          TOKEN=$(echo "$TOKEN_JSON" | jq -r '.accessToken')
+          echo "$TOKEN" | docker login "$SERVER" \
+            -u 00000000-0000-0000-0000-000000000000 --password-stdin
+          echo "server=$SERVER" >> "$GITHUB_OUTPUT"
 
-      # 🔐 Required: authenticate Scout against Docker Hub
+      # Docker Hub login is required so the runner has Docker Scout entitlement
       - name: Docker Hub login (for Docker Scout entitlement)
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Docker Scout quickview (Critical/High)
+      - name: Resolve image names
+        id: images
+        shell: bash
+        run: |
+          TAG="${{ inputs.image_tag }}"
+          [ -z "$TAG" ] && TAG=latest
+          ACR_SERVER="${{ vars.ACR_LOGIN_SERVER }}"
+          echo "product=${ACR_SERVER}/product-service:${TAG}"  >> "$GITHUB_OUTPUT"
+          echo "order=${ACR_SERVER}/order-service:${TAG}"     >> "$GITHUB_OUTPUT"
+          echo "frontend=${ACR_SERVER}/frontend:${TAG}"       >> "$GITHUB_OUTPUT"
+          echo "Using tag: $TAG"
+          echo "Server: $ACR_SERVER"
+
+      - name: Docker Scout quickview – product-service
         uses: docker/scout-action@v1
         with:
           command: quickview
-          image: |
-            ${{ env.ACR_LOGIN_SERVER }}/product-service:latest
-            ${{ env.ACR_LOGIN_SERVER }}/order-service:latest
-            ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
+          image: ${{ steps.images.outputs.product }}
           only-severities: critical,high
-          exit-code: false   # set true to fail on Critical/High
+          exit-code: true
 
-      - name: Upload report
-        uses: actions/upload-artifact@v4
+      - name: Docker Scout quickview – order-service
+        uses: docker/scout-action@v1
         with:
-          name: docker-scout-report
-          path: scout.sarif
+          command: quickview
+          image: ${{ steps.images.outputs.order }}
+          only-severities: critical,high
+          exit-code: true
+
+      - name: Docker Scout quickview – frontend
+        uses: docker/scout-action@v1
+        with:
+          command: quickview
+          image: ${{ steps.images.outputs.frontend }}
+          only-severities: critical,high
+          exit-code: true
