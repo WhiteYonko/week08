@@ -1,0 +1,55 @@
+name: Security Scan (Docker Scout)
+
+on:
+  workflow_dispatch:
+
+env:
+  # Use your repo variables if you set them; otherwise hardcode:
+  ACR_NAME: ${{ vars.ACR_NAME || 'sath08acr12345' }}
+  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER || 'sath08acr12345.azurecr.io' }}
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to ACR (pull-only token)
+        run: |
+          TOKEN=$(az acr login -n "$ACR_NAME" --expose-token --query accessToken -o tsv)
+          echo "$TOKEN" | docker login "$ACR_LOGIN_SERVER" -u 00000000-0000-0000-0000-000000000000 --password-stdin
+
+      - name: Docker Scout quickview (Critical/High)
+        uses: docker/scout-action@v1
+        with:
+          command: quickview
+          image: |
+            ${{ env.ACR_LOGIN_SERVER }}/product-service:latest
+            ${{ env.ACR_LOGIN_SERVER }}/order-service:latest
+            ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
+          only-severities: critical,high
+          sarif-file: scout.sarif
+
+      # If you want the job to FAIL when Critical/High are present, swap the step above for:
+      # - name: Docker Scout CVEs (policy gate)
+      #   uses: docker/scout-action@v1
+      #   with:
+      #     command: cves
+      #     image: |
+      #       ${{ env.ACR_LOGIN_SERVER }}/product-service:latest
+      #       ${{ env.ACR_LOGIN_SERVER }}/order-service:latest
+      #       ${{ env.ACR_LOGIN_SERVER }}/frontend:latest
+      #     only-severities: critical,high
+      #     exit-code: true
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-scout-report
+          path: scout.sarif
